@@ -63,6 +63,73 @@ def init_db():
 # =====================================================
 
 def normalize_input(df):
+    # normaliza nomes: lower + strip
+    cols = {c.strip().lower(): c for c in df.columns}
+
+    # aceita variações de nomes
+    doc_candidates = ["client document", "client_document", "clientdocument", "document", "cpf", "documento"]
+    email_candidates = ["email", "e-mail", "mail"]
+    order_candidates = ["order2", "order", "order_id", "pedido", "pedidoid"]
+    date_candidates = ["creation d", "creation date", "created at", "data", "data pedido", "data_pedido", "creationd"]
+    value_candidates = ["total value", "totalvalue", "total", "valor", "valor total", "total_value"]
+
+    def pick(candidates):
+        for k in candidates:
+            if k in cols:
+                return cols[k]
+        return None
+
+    doc_col = pick(doc_candidates)
+    email_col = pick(email_candidates)
+    order_col = pick(order_candidates)
+    date_col = pick(date_candidates)
+    value_col = pick(value_candidates)
+
+    # obrigatórios (doc OU email pode faltar, mas precisa de um dos dois)
+    if order_col is None:
+        raise ValueError(f"Não achei a coluna do pedido. Tente nomes como: {order_candidates}")
+    if date_col is None:
+        raise ValueError(f"Não achei a coluna de data. Tente nomes como: {date_candidates}")
+    if (doc_col is None) and (email_col is None):
+        raise ValueError("Não achei Client Document nem Email. Preciso de pelo menos 1 identificador do cliente.")
+
+    base = df[[order_col, date_col]].copy()
+    base.columns = ["order_id", "data_pedido"]
+
+    # doc/email opcionais (mas ao menos um existe)
+    base["client_document"] = df[doc_col] if doc_col else ""
+    base["email"] = df[email_col] if email_col else ""
+
+    # data
+    base["data_pedido"] = pd.to_datetime(base["data_pedido"], dayfirst=True, errors="coerce")
+    base = base.dropna(subset=["data_pedido", "order_id"])
+
+    # limpeza
+    doc_clean = base["client_document"].apply(clean_document)
+    email_clean = base["email"].apply(normalize_email)
+
+    identificador = doc_clean.copy()
+    mask = identificador.str.len() == 0
+    identificador.loc[mask] = email_clean.loc[mask]
+
+    base["customer_id"] = identificador.apply(lambda x: hash_id(str(x)))
+
+    base["mes_compra"] = base["data_pedido"].astype(str).str[:7]
+
+    # valor
+    if value_col:
+        valor = df[value_col].astype(str)
+        valor = (
+            valor.str.replace("R$", "", regex=False)
+                 .str.replace(".", "", regex=False)
+                 .str.replace(",", ".", regex=False)
+                 .str.strip()
+        )
+        base["valor_pedido"] = pd.to_numeric(valor, errors="coerce")
+    else:
+        base["valor_pedido"] = None
+
+    return base[["customer_id", "order_id", "data_pedido", "mes_compra", "valor_pedido"]]
 
     cols = {c.strip().lower(): c for c in df.columns}
 

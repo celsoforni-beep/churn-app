@@ -315,9 +315,24 @@ uploaded = st.file_uploader(
     type=["csv"]
 )
 
-if uploaded:
 
-    df_raw = # leitura robusta CSV Brasil
+
+   if uploaded:
+
+    # leitura robusta CSV Brasil
+    try:
+        df_raw = pd.read_csv(uploaded, sep=None, engine="python", encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            df_raw = pd.read_csv(uploaded, sep=None, engine="python", encoding="cp1252")
+        except UnicodeDecodeError:
+            df_raw = pd.read_csv(uploaded, sep=None, engine="python", encoding="latin1")
+
+    df = normalize_input(df_raw)
+
+    inserted = upsert_pedidos(df)
+
+    st.success(f"{inserted} pedidos adicionados")
 try:
     df_raw = pd.read_csv(uploaded, sep=None, engine="python", encoding="utf-8")
 except UnicodeDecodeError:

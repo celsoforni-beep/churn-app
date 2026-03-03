@@ -10,28 +10,26 @@ from datetime import date
 # =====================================================
 
 st.set_page_config(
-    page_title="Base Clientes - Novo / Retorno / Churn",
+    page_title="Sistema Clientes — Novo / Retorno / Churn",
     layout="wide"
 )
 
 DB_PATH = "clientes.db"
-
-# SALT (definido no Streamlit Secrets)
-SALT = os.getenv("HASH_SALT", "ALTERAR_NO_STREAMLIT")
+SALT = os.getenv("HASH_SALT", "default_salt")
 
 # =====================================================
-# SEGURANÇA (HASH)
+# HASH FUNCTIONS
 # =====================================================
 
-def clean_document(doc: str) -> str:
+def clean_document(doc):
     return "".join([c for c in str(doc) if c.isdigit()])
 
 
-def normalize_email(email: str) -> str:
+def normalize_email(email):
     return str(email).strip().lower()
 
 
-def sha256_hash(value: str) -> str:
+def hash_id(value):
     raw = (SALT + value).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
@@ -49,35 +47,24 @@ def init_db():
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pedidos (
-            customer_id TEXT NOT NULL,
-            order_id TEXT NOT NULL,
-            data_pedido TEXT NOT NULL,
-            mes_compra TEXT NOT NULL,
+            customer_id TEXT,
+            order_id TEXT UNIQUE,
+            data_pedido TEXT,
+            mes_compra TEXT,
             valor_pedido REAL
         )
-    """)
-
-    cur.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_order
-        ON pedidos(order_id)
     """)
 
     conn.commit()
     conn.close()
 
 # =====================================================
-# NORMALIZAÇÃO CSV
+# CSV NORMALIZATION
 # =====================================================
 
-def normalize_input(df: pd.DataFrame):
+def normalize_input(df):
 
     cols = {c.strip().lower(): c for c in df.columns}
-
-    required = ["order2", "creation d", "client document", "email"]
-
-    for r in required:
-        if r not in cols:
-            raise ValueError(f"Coluna obrigatória ausente: {r}")
 
     base = df[[
         cols["client document"],
@@ -93,34 +80,27 @@ def normalize_input(df: pd.DataFrame):
         "data_pedido"
     ]
 
-    # DATA
     base["data_pedido"] = pd.to_datetime(
         base["data_pedido"],
         dayfirst=True,
         errors="coerce"
-    ).dt.date
+    )
 
-    base = base.dropna(subset=["data_pedido", "order_id"])
+    base = base.dropna(subset=["data_pedido"])
 
-    # LIMPEZA
     doc_clean = base["client_document"].apply(clean_document)
     email_clean = base["email"].apply(normalize_email)
 
-    # PRIORIDADE DOCUMENTO -> EMAIL
     identificador = doc_clean.copy()
     mask = identificador.str.len() == 0
     identificador.loc[mask] = email_clean.loc[mask]
 
-    # HASH FINAL (SEM PII)
     base["customer_id"] = identificador.apply(
-        lambda x: sha256_hash(str(x))
+        lambda x: hash_id(str(x))
     )
 
-    # MÊS
-    base["data_pedido"] = base["data_pedido"].astype(str)
-    base["mes_compra"] = base["data_pedido"].str[:7]
+    base["mes_compra"] = base["data_pedido"].astype(str).str[:7]
 
-    # VALOR
     if "total value" in cols:
         valor = df[cols["total value"]].astype(str)
 
@@ -132,14 +112,10 @@ def normalize_input(df: pd.DataFrame):
             .str.strip()
         )
 
-        base["valor_pedido"] = pd.to_numeric(
-            valor,
-            errors="coerce"
-        )
+        base["valor_pedido"] = pd.to_numeric(valor, errors="coerce")
     else:
         base["valor_pedido"] = None
 
-    # 🔐 RETORNA SEM CPF/EMAIL
     return base[
         [
             "customer_id",
@@ -151,7 +127,7 @@ def normalize_input(df: pd.DataFrame):
     ]
 
 # =====================================================
-# INSERT HISTÓRICO
+# INSERT DATA
 # =====================================================
 
 def upsert_pedidos(df):
@@ -170,15 +146,6 @@ def upsert_pedidos(df):
         index=False
     )
 
-    conn.execute("""
-        DELETE FROM pedidos
-        WHERE rowid NOT IN (
-            SELECT MIN(rowid)
-            FROM pedidos
-            GROUP BY order_id
-        )
-    """)
-
     conn.commit()
 
     after = pd.read_sql(
@@ -191,20 +158,13 @@ def upsert_pedidos(df):
     return after - before
 
 # =====================================================
-# BASE CLIENTE
+# CLIENT BASE
 # =====================================================
 
-def build_cliente_base(ref_date,
-                       ativo_dias=90,
-                       churn_dias=180):
+def build_cliente_base(ref_date):
 
     conn = get_conn()
-
-    pedidos = pd.read_sql(
-        "SELECT * FROM pedidos",
-        conn
-    )
-
+    pedidos = pd.read_sql("SELECT * FROM pedidos", conn)
     conn.close()
 
     if pedidos.empty:
@@ -230,15 +190,8 @@ def build_cliente_base(ref_date,
     ).dt.days
 
     base["status"] = "Ativo"
-    base.loc[
-        base["dias_sem_compra"] > ativo_dias,
-        "status"
-    ] = "Em risco"
-
-    base.loc[
-        base["dias_sem_compra"] > churn_dias,
-        "status"
-    ] = "Churn"
+    base.loc[base["dias_sem_compra"] > 90, "status"] = "Em risco"
+    base.loc[base["dias_sem_compra"] > 180, "status"] = "Churn"
 
     return base.sort_values(
         "ultima_compra",
@@ -246,16 +199,13 @@ def build_cliente_base(ref_date,
     )
 
 # =====================================================
-# REPORT MENSAL
+# MONTH REPORT
 # =====================================================
 
 def month_report(mes):
 
     conn = get_conn()
-    pedidos = pd.read_sql(
-        "SELECT * FROM pedidos",
-        conn
-    )
+    pedidos = pd.read_sql("SELECT * FROM pedidos", conn)
     conn.close()
 
     if pedidos.empty:
@@ -279,8 +229,7 @@ def month_report(mes):
     clientes_mes = mes_df["customer_id"].nunique()
 
     novos = len(
-        set(first[first["mes_primeira"] == mes]
-            ["customer_id"])
+        set(first[first["mes_primeira"] == mes]["customer_id"])
         &
         set(mes_df["customer_id"])
     )
@@ -298,7 +247,7 @@ def month_report(mes):
     }])
 
 # =====================================================
-# UI STREAMLIT
+# UI
 # =====================================================
 
 init_db()
@@ -315,11 +264,9 @@ uploaded = st.file_uploader(
     type=["csv"]
 )
 
+if uploaded is not None:
 
-
-   if uploaded:
-
-    # leitura robusta CSV Brasil
+    # leitura robusta CSV BR
     try:
         df_raw = pd.read_csv(uploaded, sep=None, engine="python", encoding="utf-8")
     except UnicodeDecodeError:
@@ -333,19 +280,6 @@ uploaded = st.file_uploader(
     inserted = upsert_pedidos(df)
 
     st.success(f"{inserted} pedidos adicionados")
-try:
-    df_raw = pd.read_csv(uploaded, sep=None, engine="python", encoding="utf-8")
-except UnicodeDecodeError:
-    try:
-        df_raw = pd.read_csv(uploaded, sep=None, engine="python", encoding="cp1252")
-    except UnicodeDecodeError:
-        df_raw = pd.read_csv(uploaded, sep=None, engine="python", encoding="latin1")
-
-    df = normalize_input(df_raw)
-
-    inserted = upsert_pedidos(df)
-
-    st.success(f"{inserted} pedidos adicionados")
 
 st.divider()
 
@@ -353,13 +287,8 @@ base = build_cliente_base(ref_date)
 
 if not base.empty:
 
-    c1, c2, c3 = st.columns(3)
-
-    c1.metric("Clientes", len(base))
-    c2.metric("Ativos",
-              (base["status"]=="Ativo").sum())
-    c3.metric("Churn",
-              (base["status"]=="Churn").sum())
+    st.metric("Clientes", len(base))
+    st.metric("Churn", (base["status"]=="Churn").sum())
 
     st.dataframe(base)
 

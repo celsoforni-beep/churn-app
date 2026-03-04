@@ -4,6 +4,7 @@ import sqlite3
 import hashlib
 import os
 from datetime import date
+import traceback
 
 # =====================================================
 # CONFIG
@@ -34,7 +35,7 @@ def hash_id(value: str) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 # =====================================================
-# DATABASE (SQLite local - atenção: pode zerar em restart)
+# DATABASE
 # =====================================================
 
 def get_conn():
@@ -57,11 +58,11 @@ def init_db():
     conn.close()
 
 # =====================================================
-# INPUT NORMALIZATION
+# HELPERS
 # =====================================================
 
 def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
-    # Remove BOM + trim + normaliza
+    # remove BOM + trims
     df.columns = (
         df.columns.astype(str)
         .str.replace("\ufeff", "", regex=False)
@@ -70,9 +71,28 @@ def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def load_uploaded_file(uploaded) -> pd.DataFrame:
+    filename = uploaded.name.lower()
+
+    if filename.endswith(".xlsx"):
+        # deixa o pandas escolher engine (mais estável no cloud)
+        df = pd.read_excel(uploaded)
+        return normalize_headers(df)
+
+    # CSV robusto (encoding + separador)
+    try:
+        df = pd.read_csv(uploaded, sep=None, engine="python", encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            df = pd.read_csv(uploaded, sep=None, engine="python", encoding="cp1252")
+        except UnicodeDecodeError:
+            df = pd.read_csv(uploaded, sep=None, engine="python", encoding="latin1")
+
+    return normalize_headers(df)
+
+
 def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_headers(df)
-
     cols = {c.strip().lower(): c for c in df.columns}
 
     # candidatos (aceita variações)
@@ -95,9 +115,9 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     value_col = pick(value_candidates)
 
     if order_col is None:
-        raise ValueError(f"Não achei a coluna do pedido. Tente nomes como: {order_candidates}")
+        raise ValueError(f"Não achei a coluna do pedido. Achei colunas: {list(cols.keys())}")
     if date_col is None:
-        raise ValueError(f"Não achei a coluna de data. Tente nomes como: {date_candidates}")
+        raise ValueError(f"Não achei a coluna de data. Achei colunas: {list(cols.keys())}")
     if (doc_col is None) and (email_col is None):
         raise ValueError("Não achei Client Document nem Email. Preciso de pelo menos 1 identificador do cliente.")
 
@@ -107,11 +127,11 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     base["client_document"] = df[doc_col] if doc_col else ""
     base["email"] = df[email_col] if email_col else ""
 
-    # datas
+    # data
     base["data_pedido"] = pd.to_datetime(base["data_pedido"], dayfirst=True, errors="coerce")
     base = base.dropna(subset=["data_pedido", "order_id"])
 
-    # normalização id
+    # normalização do identificador (doc -> email)
     doc_clean = base["client_document"].apply(clean_document)
     email_clean = base["email"].apply(normalize_email)
 
@@ -119,13 +139,11 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     mask_sem_doc = identificador.str.len() == 0
     identificador.loc[mask_sem_doc] = email_clean.loc[mask_sem_doc]
 
-    # hash final (sem PII)
     base["customer_id"] = identificador.apply(lambda x: hash_id(str(x)))
 
-    # mês
     base["mes_compra"] = base["data_pedido"].dt.strftime("%Y-%m")
 
-    # valor (opcional)
+    # valor
     if value_col:
         valor = df[value_col].astype(str)
         valor = (
@@ -138,45 +156,19 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     else:
         base["valor_pedido"] = None
 
-    # devolve apenas campos sem PII
+    # retorna sem PII
     return base[["customer_id", "order_id", "data_pedido", "mes_compra", "valor_pedido"]]
 
-# =====================================================
-# LOAD FILE (XLSX or CSV)
-# =====================================================
-
-def load_uploaded_file(uploaded) -> pd.DataFrame:
-    filename = uploaded.name.lower()
-
-    if filename.endswith(".xlsx"):
-        df = pd.read_excel(uploaded, engine="openpyxl")
-        return normalize_headers(df)
-
-    # CSV robusto
-    try:
-        df = pd.read_csv(uploaded, sep=None, engine="python", encoding="utf-8")
-    except UnicodeDecodeError:
-        try:
-            df = pd.read_csv(uploaded, sep=None, engine="python", encoding="cp1252")
-        except UnicodeDecodeError:
-            df = pd.read_csv(uploaded, sep=None, engine="python", encoding="latin1")
-
-    return normalize_headers(df)
-
-# =====================================================
-# UPSERT
-# =====================================================
 
 def upsert_pedidos(df: pd.DataFrame) -> int:
     conn = get_conn()
     before = pd.read_sql("SELECT COUNT(*) n FROM pedidos", conn)["n"][0]
 
-    # append
     df2 = df.copy()
     df2["data_pedido"] = df2["data_pedido"].dt.strftime("%Y-%m-%d")
     df2.to_sql("pedidos", conn, if_exists="append", index=False)
 
-    # dedup por order_id (garantia extra)
+    # dedup extra por segurança
     conn.execute("""
         DELETE FROM pedidos
         WHERE rowid NOT IN (
@@ -191,9 +183,6 @@ def upsert_pedidos(df: pd.DataFrame) -> int:
     conn.close()
     return int(after - before)
 
-# =====================================================
-# ANALYTICS
-# =====================================================
 
 def build_cliente_base(ref_date: date, ativo_dias=90, churn_dias=180) -> pd.DataFrame:
     conn = get_conn()
@@ -235,7 +224,6 @@ def month_report(mes: str) -> pd.DataFrame:
     pedidos["data_pedido"] = pd.to_datetime(pedidos["data_pedido"], errors="coerce")
     pedidos = pedidos.dropna(subset=["data_pedido"])
 
-    # primeira compra por cliente
     first = pedidos.groupby("customer_id")["data_pedido"].min().reset_index()
     first["mes_primeira"] = first["data_pedido"].dt.strftime("%Y-%m")
 
@@ -262,7 +250,7 @@ def month_report(mes: str) -> pd.DataFrame:
     }])
 
 # =====================================================
-# UI
+# APP
 # =====================================================
 
 init_db()
@@ -277,10 +265,17 @@ churn_dias = st.sidebar.number_input("Churn (dias)", min_value=90, max_value=720
 uploaded = st.file_uploader("Upload mensal (Excel .xlsx ou CSV)", type=["xlsx", "csv"])
 
 if uploaded is not None:
-    df_raw = load_uploaded_file(uploaded)
-    df = normalize_input(df_raw)
-    inserted = upsert_pedidos(df)
-    st.success(f"{inserted} pedidos adicionados")
+    try:
+        df_raw = load_uploaded_file(uploaded)
+        st.write("✅ Colunas detectadas:", list(df_raw.columns))
+
+        df = normalize_input(df_raw)
+        inserted = upsert_pedidos(df)
+        st.success(f"{inserted} pedidos adicionados")
+
+    except Exception as e:
+        st.error("Erro ao processar o arquivo. Detalhes:")
+        st.exception(e)
 
 st.divider()
 

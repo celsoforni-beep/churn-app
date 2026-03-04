@@ -1,10 +1,12 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
 import hashlib
 import os
 from datetime import date
 import traceback
+
+import psycopg2
+from psycopg2.extras import execute_values
 
 # =====================================================
 # CONFIG
@@ -15,8 +17,10 @@ st.set_page_config(
     layout="wide"
 )
 
-DB_PATH = "clientes.db"
-SALT = os.getenv("HASH_SALT", "default_salt")  # defina no Secrets do Streamlit Cloud
+SALT = os.getenv("HASH_SALT", "default_salt")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+USE_POSTGRES = DATABASE_URL != ""
 
 # =====================================================
 # HASH (LGPD SAFE)
@@ -39,21 +43,19 @@ def hash_id(value: str) -> str:
 # =====================================================
 
 def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    if not USE_POSTGRES:
+        raise RuntimeError("DATABASE_URL não configurado no Secrets.")
+    return psycopg2.connect(DATABASE_URL)
 
 
 def init_db():
+    """
+    Supabase: assume tabela public.pedidos já criada.
+    Aqui apenas validamos conexão.
+    """
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS pedidos (
-            customer_id TEXT NOT NULL,
-            order_id TEXT NOT NULL UNIQUE,
-            data_pedido TEXT NOT NULL,
-            mes_compra TEXT NOT NULL,
-            valor_pedido REAL
-        )
-    """)
+    cur.execute("select 1;")
     conn.commit()
     conn.close()
 
@@ -62,7 +64,6 @@ def init_db():
 # =====================================================
 
 def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
-    # remove BOM + trims
     df.columns = (
         df.columns.astype(str)
         .str.replace("\ufeff", "", regex=False)
@@ -75,11 +76,10 @@ def load_uploaded_file(uploaded) -> pd.DataFrame:
     filename = uploaded.name.lower()
 
     if filename.endswith(".xlsx"):
-        # deixa o pandas escolher engine (mais estável no cloud)
-        df = pd.read_excel(uploaded)
+        df = pd.read_excel(uploaded)  # pandas escolhe engine (openpyxl)
         return normalize_headers(df)
 
-    # CSV robusto (encoding + separador)
+    # CSV robusto
     try:
         df = pd.read_csv(uploaded, sep=None, engine="python", encoding="utf-8")
     except UnicodeDecodeError:
@@ -90,6 +90,9 @@ def load_uploaded_file(uploaded) -> pd.DataFrame:
 
     return normalize_headers(df)
 
+# =====================================================
+# NORMALIZAÇÃO INPUT
+# =====================================================
 
 def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_headers(df)
@@ -115,11 +118,11 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     value_col = pick(value_candidates)
 
     if order_col is None:
-        raise ValueError(f"Não achei a coluna do pedido. Achei colunas: {list(cols.keys())}")
+        raise ValueError(f"Não achei coluna de pedido. Colunas detectadas: {list(cols.keys())}")
     if date_col is None:
-        raise ValueError(f"Não achei a coluna de data. Achei colunas: {list(cols.keys())}")
+        raise ValueError(f"Não achei coluna de data. Colunas detectadas: {list(cols.keys())}")
     if (doc_col is None) and (email_col is None):
-        raise ValueError("Não achei Client Document nem Email. Preciso de pelo menos 1 identificador do cliente.")
+        raise ValueError("Não achei Client Document nem Email. Preciso de pelo menos 1 identificador.")
 
     base = df[[order_col, date_col]].copy()
     base.columns = ["order_id", "data_pedido"]
@@ -131,7 +134,7 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     base["data_pedido"] = pd.to_datetime(base["data_pedido"], dayfirst=True, errors="coerce")
     base = base.dropna(subset=["data_pedido", "order_id"])
 
-    # normalização do identificador (doc -> email)
+    # id doc -> email
     doc_clean = base["client_document"].apply(clean_document)
     email_clean = base["email"].apply(normalize_email)
 
@@ -156,37 +159,57 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     else:
         base["valor_pedido"] = None
 
-    # retorna sem PII
+    # SEM PII
     return base[["customer_id", "order_id", "data_pedido", "mes_compra", "valor_pedido"]]
 
+# =====================================================
+# UPSERT POSTGRES (SUPABASE)
+# =====================================================
 
 def upsert_pedidos(df: pd.DataFrame) -> int:
     conn = get_conn()
-    before = pd.read_sql("SELECT COUNT(*) n FROM pedidos", conn)["n"][0]
+    cur = conn.cursor()
+
+    # antes
+    before = pd.read_sql("select count(*) as n from public.pedidos", conn)["n"][0]
 
     df2 = df.copy()
-    df2["data_pedido"] = df2["data_pedido"].dt.strftime("%Y-%m-%d")
-    df2.to_sql("pedidos", conn, if_exists="append", index=False)
+    df2["data_pedido"] = pd.to_datetime(df2["data_pedido"]).dt.date
 
-    # dedup extra por segurança
-    conn.execute("""
-        DELETE FROM pedidos
-        WHERE rowid NOT IN (
-            SELECT MIN(rowid)
-            FROM pedidos
-            GROUP BY order_id
-        )
-    """)
+    rows = list(
+        df2[["customer_id", "order_id", "data_pedido", "mes_compra", "valor_pedido"]]
+        .itertuples(index=False, name=None)
+    )
+
+    execute_values(
+        cur,
+        """
+        insert into public.pedidos (customer_id, order_id, data_pedido, mes_compra, valor_pedido)
+        values %s
+        on conflict (order_id) do update set
+          customer_id = excluded.customer_id,
+          data_pedido = excluded.data_pedido,
+          mes_compra = excluded.mes_compra,
+          valor_pedido = excluded.valor_pedido
+        """,
+        rows,
+        page_size=5000
+    )
+
     conn.commit()
 
-    after = pd.read_sql("SELECT COUNT(*) n FROM pedidos", conn)["n"][0]
+    after = pd.read_sql("select count(*) as n from public.pedidos", conn)["n"][0]
     conn.close()
+
     return int(after - before)
 
+# =====================================================
+# ANALYTICS
+# =====================================================
 
 def build_cliente_base(ref_date: date, ativo_dias=90, churn_dias=180) -> pd.DataFrame:
     conn = get_conn()
-    pedidos = pd.read_sql("SELECT * FROM pedidos", conn)
+    pedidos = pd.read_sql("select * from public.pedidos", conn)
     conn.close()
 
     if pedidos.empty:
@@ -215,7 +238,7 @@ def build_cliente_base(ref_date: date, ativo_dias=90, churn_dias=180) -> pd.Data
 
 def month_report(mes: str) -> pd.DataFrame:
     conn = get_conn()
-    pedidos = pd.read_sql("SELECT * FROM pedidos", conn)
+    pedidos = pd.read_sql("select * from public.pedidos", conn)
     conn.close()
 
     if pedidos.empty:
@@ -250,12 +273,17 @@ def month_report(mes: str) -> pd.DataFrame:
     }])
 
 # =====================================================
-# APP
+# APP UI
 # =====================================================
 
-init_db()
+try:
+    init_db()
+except Exception as e:
+    st.error("❌ Falha ao conectar no Supabase. Verifique DATABASE_URL no Secrets.")
+    st.exception(e)
+    st.stop()
 
-st.title("📊 Sistema Clientes — Novo / Retorno / Churn")
+st.title("📊 Sistema Clientes — Novo / Retorno / Churn (Supabase)")
 
 st.sidebar.header("Configurações")
 ref_date = st.sidebar.date_input("Data fechamento", value=date.today())
@@ -271,7 +299,7 @@ if uploaded is not None:
 
         df = normalize_input(df_raw)
         inserted = upsert_pedidos(df)
-        st.success(f"{inserted} pedidos adicionados")
+        st.success(f"{inserted} pedidos adicionados (Supabase)")
 
     except Exception as e:
         st.error("Erro ao processar o arquivo. Detalhes:")
@@ -282,7 +310,7 @@ st.divider()
 base = build_cliente_base(ref_date, ativo_dias=ativo_dias, churn_dias=churn_dias)
 
 if base.empty:
-    st.info("Ainda não há dados. Faça upload do arquivo do mês para criar a base.")
+    st.info("Ainda não há dados no Supabase. Faça upload do arquivo do mês para criar a base.")
 else:
     c1, c2, c3 = st.columns(3)
     c1.metric("Clientes", f"{len(base):,}".replace(",", "."))

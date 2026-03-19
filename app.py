@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import hashlib
 import os
-from datetime import date
 import psycopg2
 from psycopg2.extras import execute_values
 
@@ -33,6 +32,43 @@ def normalize_email(email) -> str:
 def hash_id(value: str) -> str:
     raw = (SALT + value).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+# =====================================================
+# FORMATTERS
+# =====================================================
+
+def format_brl(value):
+    if pd.isna(value):
+        return ""
+    return f"R$ {float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def format_int_br(value):
+    if pd.isna(value):
+        return ""
+    return f"{int(value):,}".replace(",", ".")
+
+
+def format_pct(value):
+    if pd.isna(value):
+        return ""
+    return f"{float(value):.1%}".replace(".", ",")
+
+# =====================================================
+# BRAND NORMALIZATION
+# =====================================================
+
+def normalize_brand(value: str) -> str:
+    v = str(value).strip().upper()
+
+    if v in ["MIZ", "MIZUNO"]:
+        return "MIZ"
+    if v in ["OLYMPIKUS", "OLIMPIKUS"]:
+        return "OLYMPIKUS"
+    if v in ["UA", "UNDER ARMOUR", "UNDERARMOUR"]:
+        return "UA"
+
+    return v
 
 # =====================================================
 # DATABASE
@@ -82,38 +118,52 @@ def load_uploaded_file(uploaded) -> pd.DataFrame:
     return normalize_headers(df)
 
 
-def normalize_value_series(series: pd.Series) -> pd.Series:
-    # Se já vier numérico, mantém
-    if pd.api.types.is_numeric_dtype(series):
-        return pd.to_numeric(series, errors="coerce")
-
-    valor = series.astype(str).str.strip()
-
-    # remove símbolo e espaços
-    valor = valor.str.replace("R$", "", regex=False).str.strip()
-
-    # formato BR: 1.120,96
-    mask_br = valor.str.contains(",", na=False)
-
-    valor_br = (
-        valor[mask_br]
-        .str.replace(".", "", regex=False)
-        .str.replace(",", ".", regex=False)
-    )
-
-    # formato decimal normal: 1120.96
-    valor_std = valor[~mask_br]
-
-    valor_final = pd.concat([valor_br, valor_std]).sort_index()
-
-    return pd.to_numeric(valor_final, errors="coerce")
-
-
 def pick_column(cols_map, candidates):
     for k in candidates:
         if k in cols_map:
             return cols_map[k]
     return None
+
+
+def normalize_value_series(series: pd.Series) -> pd.Series:
+    """
+    Aceita:
+    - número puro vindo do Excel
+    - 'R$ 98,71'
+    - '98,71'
+    - '98.71'
+    - 'R$ 1.120,96'
+    """
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+
+    s = series.astype(str).str.strip()
+
+    s = (
+        s.str.replace("R$", "", regex=False)
+         .str.replace("\xa0", "", regex=False)
+         .str.strip()
+    )
+
+    def parse_value(x):
+        x = str(x).strip()
+        if x == "" or x.lower() in ["nan", "none"]:
+            return None
+
+        if "," in x:
+            x = x.replace(".", "")
+            x = x.replace(",", ".")
+            try:
+                return float(x)
+            except:
+                return None
+
+        try:
+            return float(x)
+        except:
+            return None
+
+    return s.apply(parse_value)
 
 # =====================================================
 # NORMALIZAÇÃO INPUT
@@ -134,7 +184,7 @@ def normalize_input(df: pd.DataFrame, mode: str) -> pd.DataFrame:
     order_candidates = ["order", "order2", "order 2", "order_id", "orderid", "pedido", "pedido id", "pedidoid"]
     date_candidates = ["creation d", "creation date", "created at", "data", "data pedido", "data_pedido", "creationd"]
     value_candidates = ["total value", "totalvalue", "total", "valor", "valor total", "total_value"]
-    media_candidates = ["midia", "media", "source", "utm_source", "canal"]
+    media_candidates = ["midia", "media", "source", "utm_source", "canal", "channel"]
     coupon_candidates = ["cupom", "coupon", "cupom_code", "coupon_code"]
 
     seller_col = pick_column(cols, seller_candidates)
@@ -161,7 +211,7 @@ def normalize_input(df: pd.DataFrame, mode: str) -> pd.DataFrame:
     base["client_document"] = df[doc_col] if doc_col else ""
     base["email"] = df[email_col] if email_col else ""
 
-    base["marca"] = base["marca"].astype(str).str.strip().str.upper()
+    base["marca"] = base["marca"].apply(normalize_brand)
     base["order_id"] = base["order_id"].astype(str).str.strip()
 
     base["data_pedido"] = pd.to_datetime(base["data_pedido"], dayfirst=True, errors="coerce")
@@ -183,10 +233,10 @@ def normalize_input(df: pd.DataFrame, mode: str) -> pd.DataFrame:
         base["valor_pedido"] = None
 
     if mode == "mensal_2026":
-        base["midia"] = df[media_col].astype(str).str.strip() if media_col else "SEM_MIDIA"
+        base["midia"] = df[media_col].astype(str).str.strip() if media_col else "SEM_CANAL"
         base["cupom"] = df[coupon_col].astype(str).str.strip() if coupon_col else "SEM_CUPOM"
 
-        base.loc[base["midia"].isin(["", "nan", "None"]), "midia"] = "SEM_MIDIA"
+        base.loc[base["midia"].isin(["", "nan", "None"]), "midia"] = "SEM_CANAL"
         base.loc[base["cupom"].isin(["", "nan", "None"]), "cupom"] = "SEM_CUPOM"
 
         return base[[
@@ -210,42 +260,6 @@ def ensure_2026_columns():
     cur.execute("alter table public.pedidos add column if not exists cupom text;")
     conn.commit()
     conn.close()
-
-
-def upsert_pedidos_2025(df: pd.DataFrame) -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    before = pd.read_sql("select count(*) as n from public.pedidos", conn)["n"][0]
-
-    df2 = df.copy()
-    df2["data_pedido"] = pd.to_datetime(df2["data_pedido"]).dt.date
-
-    rows = list(
-        df2[["customer_id", "marca", "order_id", "data_pedido", "mes_compra", "valor_pedido"]]
-        .itertuples(index=False, name=None)
-    )
-
-    execute_values(
-        cur,
-        """
-        insert into public.pedidos (customer_id, marca, order_id, data_pedido, mes_compra, valor_pedido)
-        values %s
-        on conflict (order_id, marca) do update set
-          customer_id = excluded.customer_id,
-          data_pedido = excluded.data_pedido,
-          mes_compra = excluded.mes_compra,
-          valor_pedido = excluded.valor_pedido
-        """,
-        rows,
-        page_size=5000
-    )
-
-    conn.commit()
-    after = pd.read_sql("select count(*) as n from public.pedidos", conn)["n"][0]
-    conn.close()
-
-    return int(after - before)
 
 
 def upsert_pedidos_2026(df: pd.DataFrame) -> int:
@@ -322,14 +336,36 @@ def resumo_base_2025() -> pd.DataFrame:
     return resumo
 
 # =====================================================
+# FILTROS DINÂMICOS
+# =====================================================
+
+@st.cache_data(ttl=300)
+def listar_canais_mes(mes_ref: str):
+    conn = get_conn()
+    q = """
+    select distinct coalesce(midia, 'SEM_CANAL') as canal
+    from public.pedidos
+    where mes_compra = %(mes_ref)s
+      and data_pedido >= date '2026-01-01'
+    order by canal
+    """
+    df = pd.read_sql(q, conn, params={"mes_ref": mes_ref})
+    conn.close()
+
+    canais = ["TODOS"]
+    if not df.empty:
+        canais += df["canal"].astype(str).tolist()
+    return canais
+
+# =====================================================
 # ANALYTICS 2026
 # =====================================================
 
 @st.cache_data(ttl=300)
-def analisar_mes_2026(mes_ref: str, marca_ref: str = "TODAS"):
+def analisar_mes_2026(mes_ref: str, marca_ref: str = "TODAS", canal_ref: str = "TODOS"):
     conn = get_conn()
 
-    query_mes = f"""
+    query_mes = """
     select
         p.customer_id,
         p.marca,
@@ -337,7 +373,7 @@ def analisar_mes_2026(mes_ref: str, marca_ref: str = "TODAS"):
         p.data_pedido,
         p.mes_compra,
         p.valor_pedido,
-        coalesce(p.midia, 'SEM_MIDIA') as midia,
+        coalesce(p.midia, 'SEM_CANAL') as canal,
         coalesce(p.cupom, 'SEM_CUPOM') as cupom,
         b.status_2025,
         case
@@ -353,39 +389,101 @@ def analisar_mes_2026(mes_ref: str, marca_ref: str = "TODAS"):
       and p.data_pedido >= date '2026-01-01'
     """
 
-    params = {"mes_ref": mes_ref}
-    df = pd.read_sql(query_mes, conn, params=params)
-    conn.close()
+    df = pd.read_sql(query_mes, conn, params={"mes_ref": mes_ref})
 
     if df.empty:
+        conn.close()
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     if marca_ref != "TODAS":
         df = df[df["marca"] == marca_ref].copy()
 
+    if canal_ref != "TODOS":
+        df = df[df["canal"] == canal_ref].copy()
+
+    if df.empty:
+        conn.close()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    clientes_mes = int(df["customer_id"].nunique())
+    pedidos_mes = int(df["order_id"].nunique())
+    receita_mes = float(df["valor_pedido"].sum(skipna=True))
+
+    novos = int(df.loc[df["classificacao_2026"] == "Novo", "customer_id"].nunique())
+    retorno = int(df.loc[df["classificacao_2026"] == "Retorno", "customer_id"].nunique())
+    recuperados = int(df.loc[df["classificacao_2026"] == "Recuperado_Churn_2025", "customer_id"].nunique())
+
+    ticket_medio = receita_mes / pedidos_mes if pedidos_mes else 0
+    pct_novos = novos / clientes_mes if clientes_mes else 0
+    pct_recuperados = recuperados / clientes_mes if clientes_mes else 0
+
+    # LTV histórico médio dos clientes filtrados
+    clientes_filtrados = df[["customer_id", "marca"]].drop_duplicates()
+
+    if marca_ref == "TODAS":
+        hist_query = """
+        select
+            customer_id,
+            coalesce(sum(valor_pedido), 0) as receita_historica
+        from public.pedidos
+        where customer_id = any(%(clientes)s)
+        group by customer_id
+        """
+        hist_df = pd.read_sql(
+            hist_query,
+            conn,
+            params={"clientes": clientes_filtrados["customer_id"].tolist()}
+        )
+        ltv_historico_medio = float(hist_df["receita_historica"].mean()) if not hist_df.empty else 0
+    else:
+        hist_query = """
+        select
+            customer_id,
+            marca,
+            coalesce(sum(valor_pedido), 0) as receita_historica
+        from public.pedidos
+        where customer_id = any(%(clientes)s)
+          and marca = %(marca)s
+        group by customer_id, marca
+        """
+        hist_df = pd.read_sql(
+            hist_query,
+            conn,
+            params={
+                "clientes": clientes_filtrados["customer_id"].tolist(),
+                "marca": marca_ref
+            }
+        )
+        ltv_historico_medio = float(hist_df["receita_historica"].mean()) if not hist_df.empty else 0
+
     resumo = pd.DataFrame([{
         "Mes": mes_ref,
         "Marca": marca_ref,
-        "Clientes_Mes": int(df["customer_id"].nunique()),
-        "Pedidos_Mes": int(df["order_id"].nunique()),
-        "Receita_Mes": float(df["valor_pedido"].sum(skipna=True)),
-        "Novos": int(df.loc[df["classificacao_2026"] == "Novo", "customer_id"].nunique()),
-        "Retorno": int(df.loc[df["classificacao_2026"] == "Retorno", "customer_id"].nunique()),
-        "Recuperados_Churn_2025": int(df.loc[df["classificacao_2026"] == "Recuperado_Churn_2025", "customer_id"].nunique())
+        "Canal": canal_ref,
+        "Clientes_Mes": clientes_mes,
+        "Pedidos_Mes": pedidos_mes,
+        "Receita_Mes": receita_mes,
+        "Novos": novos,
+        "% Novos": pct_novos,
+        "Retorno": retorno,
+        "Recuperados_Churn_2025": recuperados,
+        "% Recuperados": pct_recuperados,
+        "Ticket_Medio": ticket_medio,
+        "LTV_Historico_Medio": ltv_historico_medio
     }])
 
-    midia = (
-        df.groupby(["midia", "classificacao_2026"])
+    ranking_canal = (
+        df.groupby(["canal", "classificacao_2026"])
         .agg(
             clientes=("customer_id", "nunique"),
             pedidos=("order_id", "nunique"),
             receita=("valor_pedido", "sum")
         )
         .reset_index()
-        .sort_values(["midia", "classificacao_2026"])
+        .sort_values(["canal", "classificacao_2026"])
     )
 
-    cupom = (
+    ranking_cupom = (
         df.groupby(["cupom", "classificacao_2026"])
         .agg(
             clientes=("customer_id", "nunique"),
@@ -407,7 +505,8 @@ def analisar_mes_2026(mes_ref: str, marca_ref: str = "TODAS"):
         .sort_values(["marca", "classificacao_2026"])
     )
 
-    return resumo, midia, cupom, detalhe
+    conn.close()
+    return resumo, ranking_canal, ranking_cupom, detalhe
 
 # =====================================================
 # APP
@@ -433,8 +532,13 @@ resumo_2025 = resumo_base_2025()
 if resumo_2025.empty:
     st.warning("A tabela clientes_base_2025 está vazia ou não foi criada.")
 else:
+    resumo_2025_display = resumo_2025.copy()
+    for col in ["clientes", "ativos", "em_risco", "churn"]:
+        resumo_2025_display[col] = resumo_2025_display[col].apply(format_int_br)
+    resumo_2025_display["receita_total"] = resumo_2025_display["receita_total"].apply(format_brl)
+
     st.subheader("Resumo base 2025 por marca")
-    st.dataframe(resumo_2025, use_container_width=True)
+    st.dataframe(resumo_2025_display, use_container_width=True)
 
     base2025 = build_cliente_base_2025()
     st.download_button(
@@ -467,6 +571,7 @@ if uploaded_2026 is not None:
         inserted_2026 = upsert_pedidos_2026(df_2026)
 
         analisar_mes_2026.clear()
+        listar_canais_mes.clear()
 
         st.success(f"{inserted_2026} pedidos adicionados / atualizados em 2026")
 
@@ -482,7 +587,7 @@ st.divider()
 
 st.header("3. Análise mensal 2026")
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 
 with col1:
     mes_ref = st.text_input("Mês de análise (YYYY-MM)", value="2026-01")
@@ -494,22 +599,55 @@ with col2:
         index=0
     )
 
-resumo_mes, ranking_midia, ranking_cupom, detalhe_marca = analisar_mes_2026(mes_ref, marca_ref)
+with col3:
+    canais = listar_canais_mes(mes_ref)
+    canal_ref = st.selectbox("Canal", options=canais, index=0)
+
+resumo_mes, ranking_canal, ranking_cupom, detalhe_marca = analisar_mes_2026(mes_ref, marca_ref, canal_ref)
 
 if resumo_mes.empty:
-    st.info("Sem dados para esse mês / marca.")
+    st.info("Sem dados para esse mês / marca / canal.")
 else:
-    st.subheader("Resumo executivo do mês")
-    st.dataframe(resumo_mes, use_container_width=True)
+    resumo_mes_display = resumo_mes.copy()
 
-    st.subheader("Ranking por mídia")
-    st.dataframe(ranking_midia, use_container_width=True)
+    for col in ["Clientes_Mes", "Pedidos_Mes", "Novos", "Retorno", "Recuperados_Churn_2025"]:
+        resumo_mes_display[col] = resumo_mes_display[col].apply(format_int_br)
+
+    for col in ["% Novos", "% Recuperados"]:
+        resumo_mes_display[col] = resumo_mes_display[col].apply(format_pct)
+
+    for col in ["Receita_Mes", "Ticket_Medio", "LTV_Historico_Medio"]:
+        resumo_mes_display[col] = resumo_mes_display[col].apply(format_brl)
+
+    ranking_canal_display = ranking_canal.copy()
+    if not ranking_canal_display.empty:
+        ranking_canal_display["clientes"] = ranking_canal_display["clientes"].apply(format_int_br)
+        ranking_canal_display["pedidos"] = ranking_canal_display["pedidos"].apply(format_int_br)
+        ranking_canal_display["receita"] = ranking_canal_display["receita"].apply(format_brl)
+
+    ranking_cupom_display = ranking_cupom.copy()
+    if not ranking_cupom_display.empty:
+        ranking_cupom_display["clientes"] = ranking_cupom_display["clientes"].apply(format_int_br)
+        ranking_cupom_display["pedidos"] = ranking_cupom_display["pedidos"].apply(format_int_br)
+        ranking_cupom_display["receita"] = ranking_cupom_display["receita"].apply(format_brl)
+
+    detalhe_marca_display = detalhe_marca.copy()
+    if not detalhe_marca_display.empty:
+        detalhe_marca_display["clientes"] = detalhe_marca_display["clientes"].apply(format_int_br)
+        detalhe_marca_display["pedidos"] = detalhe_marca_display["pedidos"].apply(format_int_br)
+        detalhe_marca_display["receita"] = detalhe_marca_display["receita"].apply(format_brl)
+
+    st.subheader("Resumo executivo do mês")
+    st.dataframe(resumo_mes_display, use_container_width=True)
+
+    st.subheader("Ranking por canal")
+    st.dataframe(ranking_canal_display, use_container_width=True)
 
     st.subheader("Ranking por cupom")
-    st.dataframe(ranking_cupom, use_container_width=True)
+    st.dataframe(ranking_cupom_display, use_container_width=True)
 
     st.subheader("Resumo por classificação")
-    st.dataframe(detalhe_marca, use_container_width=True)
+    st.dataframe(detalhe_marca_display, use_container_width=True)
 
     st.download_button(
         "Baixar resumo_mes_2026.csv",
@@ -519,9 +657,9 @@ else:
     )
 
     st.download_button(
-        "Baixar ranking_midia_2026.csv",
-        data=ranking_midia.to_csv(index=False).encode("utf-8"),
-        file_name=f"ranking_midia_{mes_ref}.csv",
+        "Baixar ranking_canal_2026.csv",
+        data=ranking_canal.to_csv(index=False).encode("utf-8"),
+        file_name=f"ranking_canal_{mes_ref}.csv",
         mime="text/csv"
     )
 

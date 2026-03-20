@@ -417,44 +417,12 @@ def analisar_mes_2026(mes_ref: str, marca_ref: str = "TODAS", canal_ref: str = "
     pct_novos = novos / clientes_mes if clientes_mes else 0
     pct_recuperados = recuperados / clientes_mes if clientes_mes else 0
 
-    # LTV histórico médio dos clientes filtrados
-    clientes_filtrados = df[["customer_id", "marca"]].drop_duplicates()
-
-    if marca_ref == "TODAS":
-        hist_query = """
-        select
-            customer_id,
-            coalesce(sum(valor_pedido), 0) as receita_historica
-        from public.pedidos
-        where customer_id = any(%(clientes)s)
-        group by customer_id
-        """
-        hist_df = pd.read_sql(
-            hist_query,
-            conn,
-            params={"clientes": clientes_filtrados["customer_id"].tolist()}
-        )
-        ltv_historico_medio = float(hist_df["receita_historica"].mean()) if not hist_df.empty else 0
-    else:
-        hist_query = """
-        select
-            customer_id,
-            marca,
-            coalesce(sum(valor_pedido), 0) as receita_historica
-        from public.pedidos
-        where customer_id = any(%(clientes)s)
-          and marca = %(marca)s
-        group by customer_id, marca
-        """
-        hist_df = pd.read_sql(
-            hist_query,
-            conn,
-            params={
-                "clientes": clientes_filtrados["customer_id"].tolist(),
-                "marca": marca_ref
-            }
-        )
-        ltv_historico_medio = float(hist_df["receita_historica"].mean()) if not hist_df.empty else 0
+    # =================================================
+    # LTV CORRIGIDO:
+    # média da receita dos clientes dentro do período filtrado
+    # =================================================
+    ltv_df = df.groupby("customer_id")["valor_pedido"].sum().reset_index()
+    ltv_historico_medio = float(ltv_df["valor_pedido"].mean()) if not ltv_df.empty else 0
 
     resumo = pd.DataFrame([{
         "Mes": mes_ref,
